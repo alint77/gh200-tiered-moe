@@ -206,10 +206,13 @@ can't move.
 
 A prefill chunk is 8K tokens, so every cold expert gets used many times. The
 GPU's L2 cache doesn't hold Grace memory, so reading cold experts in place means
-streaming the same weights over the link again and again. In prefill we instead
-copy the next layer's cold experts into a spare HBM slot while the current layer
-computes. That cuts time to first token by 17–23% on MiMo. Decode keeps reading
-in place.
+streaming the same weights over the link again and again.
+
+So prefill uses standard layer-ahead (L+1) prefetching: while layer L computes,
+layer L+1's cold experts are copied host-to-device into a spare HBM slot. It
+works here because a big batch makes each layer's compute long enough to hide
+the copy completely. That cuts time to first token by 17–23% on MiMo. Decode
+steps are far too short to hide a copy, so decode keeps reading in place.
 
 ## 6. Outside the MoE: sampling
 
