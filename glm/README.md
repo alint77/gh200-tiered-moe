@@ -124,8 +124,12 @@ Each configuration is measured on the same prompts with greedy decoding, arms
 alternated across two nodes. Two things make that harder than it sounds:
 - greedy output isn't reproducible here, so the number of draft tokens accepted
   per step varies run to run;
-- **step time rises ~1.8 ms per extra accepted token**, which it shouldn't (the
-  verify is always 8 tokens). We don't yet know why.
+- **step time rises with the number of accepted tokens**, even though the verify
+  is always 8 tokens: a step whose 7 drafts are all accepted takes ~3.7 ms longer
+  than one where none are. Logging every step shows it follows the *text* more
+  than the step: stretches of predictable text accept well and also verify
+  slower, most likely because 8 coherent tokens touch more distinct experts
+  (and more cold ones) than a batch that's rejected early.
 
 So every comparison is a fit at matched acceptance:
 
@@ -146,16 +150,24 @@ unprofiled step is ~36 ms at this acceptance). What's left, roughly in order:
 - **DCP's collectives**, ~2.3 ms;
 - **the drafter**, ~3.8 ms; its biggest piece is reading the 155K-token output
   layer seven times, which is already at 93% of bandwidth;
-- the unexplained ~1.8 ms per accepted token.
+- the acceptance-dependent cost above, which comes with the text rather than
+  with any one kernel.
 
 ## Being worked on
 
-- Cheaper DCP collectives: vLLM's all-to-all combine (2 collectives per layer
-  instead of 3) is being measured, then NCCL's low-latency symmetric-memory
-  kernels.
+- Cheaper DCP collectives. vLLM's all-to-all combine (2 collectives per layer
+  instead of 3) measured -0.2 ms, within noise; NCCL's symmetric-memory kernels
+  break CUDA graph capture on this stack. Next is a one-shot gather and scatter
+  over the same shared buffers vLLM's custom all-reduce already uses.
 - A bf16 kernel for the 8-token dense GEMMs, reusing the one-kernel MoE's
   weight-streaming engine.
-- GSM8K on the new configuration against the old one.
+
+## Accuracy
+
+GSM8K, the same 1,000 questions on both setups: **91.2% now against 91.4%
+before**, a difference of -0.2 points (95% interval -1.4 to +1.0). The two get
+different questions right about equally often (18 vs 20), which is what noise
+looks like.
 
 ## Where the data is
 
