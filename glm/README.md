@@ -9,7 +9,7 @@ what it took. It gets updated as work lands.
 | GLM-5.3, c=1, MTP7, 400K | decode step* | tok/s* |
 | --- | ---: | ---: |
 | where this round started | 46.6 ms | ~129 |
-| now | **39.3 ms** | **~153** |
+| now | **36.2 ms** | **~166** |
 
 \*On a greedy bench at a matched 6 accepted tokens per step (see
 [Measuring it](#measuring-it-acceptance-gets-in-the-way)). Real Claude-Code-style
@@ -106,8 +106,17 @@ parallelism (DCP4) each GPU keeps a quarter of it. Two things improve:
   queries are gathered across GPUs, so the kernel sees 64 real heads.
 
 The catch is three small collectives per layer (gather queries, gather softmax
-sums, scatter outputs), each ~7-12 µs. They cost ~2.3 ms per step and eat most of
-the gain: **-1.1 ms net.** Making those cheaper is next.
+sums, scatter outputs), each ~7-12 µs through NCCL. They cost ~2.3 ms per step and
+ate most of the gain: **-1.1 ms net** at first.
+
+vLLM already has a fast path for small all-reduces: each GPU reads the others'
+buffers directly over NVLink, between two cheap barriers, in one kernel. The same
+trick works for a gather (copy instead of add) and a reduce-scatter (add only your
+own slice), reusing that path's shared buffers and CUDA-graph bookkeeping. A query
+gather dropped from 13.8 to 6.7 µs, and end to end the step got **3.1 ms faster**,
+more than the collectives' own kernel time: NCCL was also leaving gaps between
+kernels that are now gone. (vLLM's all-to-all variant of the combine measured
+within noise; NCCL's symmetric-memory kernels broke CUDA graph capture here.)
 
 ## 5. The drafter was running uncaptured
 
@@ -139,15 +148,18 @@ So every comparison is a fit at matched acceptance:
 
 ![step breakdown](figs/glm-step-breakdown.png)
 
-The MoE is down from 21.6 to 14.7 ms and the all-reduces, which are mostly GPUs
-waiting on each other, from 11.8 to 3.3 ms (profiled, which inflates things; the
-unprofiled step is ~36 ms at this acceptance). What's left, roughly in order:
+The two captures happened to accept very different numbers of draft tokens (2.3
+vs 6.6 per step), and a step whose drafts are mostly accepted is the slower kind
+(see above), so the lower bar is the harder case and still comes in at 39.9 ms
+against 57.2 (profiled; the profiler adds a few ms). The all-reduces, which are
+mostly GPUs waiting on each other, fell from 11.8 to 3.6 ms, and the idle gaps
+from 5.5 to 2.3. What's left, roughly in order:
 - **the MoE itself** is now mostly the cold experts' C2C reads plus the hot tier;
 - **dense GEMMs** at 8 tokens run at 40-78% of the HBM read floor, ~1.5 ms to gain:
 
   ![GEMM efficiency](figs/glm-gemm.png)
 
-- **DCP's collectives**, ~2.3 ms;
+- **DCP's collectives**, now ~1.6 ms;
 - **the drafter**, ~3.8 ms; its biggest piece is reading the 155K-token output
   layer seven times, which is already at 93% of bandwidth;
 - the acceptance-dependent cost above, which comes with the text rather than
@@ -155,12 +167,9 @@ unprofiled step is ~36 ms at this acceptance). What's left, roughly in order:
 
 ## Being worked on
 
-- Cheaper DCP collectives. vLLM's all-to-all combine (2 collectives per layer
-  instead of 3) measured -0.2 ms, within noise; NCCL's symmetric-memory kernels
-  break CUDA graph capture on this stack. Next is a one-shot gather and scatter
-  over the same shared buffers vLLM's custom all-reduce already uses.
-- A bf16 kernel for the 8-token dense GEMMs, reusing the one-kernel MoE's
-  weight-streaming engine.
+- A bf16 kernel for the 8-token dense GEMMs. The production kernels take ~5.8 ms
+  per step against a ~3 ms read floor. A first weight-streaming version is
+  correct but slower than cuBLAS; it's being profiled.
 
 ## Accuracy
 
