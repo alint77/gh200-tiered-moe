@@ -15,6 +15,9 @@ HBM, on one 4x GH200 node with vLLM:
 
 Both at batch one with speculative decoding. GSM8K doesn't move.
 
+**GLM-5.3** is in progress on the same node, one user, MTP7, 400K context:
+[glm/README.md](glm/README.md) tracks what was different and what it took.
+
 ## The hardware
 
 ```mermaid
