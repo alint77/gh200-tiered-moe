@@ -9,13 +9,14 @@ what it took. It gets updated as work lands.
 Both models measured the same way, on the agentic coding tasks MiMo's routing
 profile was built from (see [How it's measured](#how-its-measured)):
 
-| one user, same tasks and harness | decode step* | decode tok/s |
-| --- | ---: | ---: |
-| **GLM-5.3** W4A16, MTP7, DCP4, 400K | **28.1 ms** | **~124** |
-| MiMo-V2.6 MXFP4, DFlash k=7, 250K | 16.9 ms | ~201 |
+| one user, same tasks and harness | decode step* | accepted/step | decode tok/s |
+| --- | ---: | ---: | ---: |
+| **GLM-5.3** W4A16, MTP7, DCP4, 400K | **28.1 ms** | 3.49 | **~124** |
+| **GLM-5.3** W4A16, DFlash2 (eager draft), DCP4, 400K | 26.9 ms | 3.35 | ~125 |
+| MiMo-V2.6 MXFP4, DFlash k=7, 250K | 16.9 ms | 3.53 | ~201 |
 
-\*Fitted at a matched 3.5 accepted tokens per step and 8K context; both models
-accept 3.4-3.5 on these tasks.
+\*Fitted at matched acceptance and 8K context; tok/s is step-weighted over the
+whole task set. All three accept 3.3-3.5 tokens per step on these tasks.
 
 ## How it's measured
 
@@ -61,23 +62,28 @@ were measured on looping text; they're marked *(greedy bench)*.
 
 ![GLM vs MiMo per decode step](figs/glm-vs-mimo.png)
 
-Profiled on the agentic tasks, four windows per model. **The MoE costs the same
-on both** (8.2 vs 8.9 ms per step): GLM's experts are larger, but it touches
-about as many of them per step (~650 hot and ~130 cold per GPU on both), and
-at equal expert counts its INT4 kernel is within 2-7% of MiMo's MXFP4 one.
-GLM's extra ~9 ms is everything around the MoE:
-- **the drafter, +2.8 ms**: seven sequential passes against one, each reading
-  the 155K-token output layer;
-- **dense GEMMs, +2.1 ms**: GLM's MLA and indexer projections and its shared
+Profiled on the agentic tasks, four windows per model, with GLM running the
+same kind of drafter as MiMo (DFlash2, section 6). GLM's experts are larger,
+but it touches about as many of them per step (~650 hot and ~130 cold per GPU
+on both), and at equal expert counts its INT4 kernel is within 2-7% of MiMo's
+MXFP4 one. So the MoE is not where the gap is: 9.5 against 8.9 ms, and with
+MTP7 and a bigger hot set GLM's MoE is actually cheaper (8.2 ms). GLM's extra
+~9 ms is everything around it:
+- **dense GEMMs, +2.2 ms**: GLM's MLA and indexer projections and its shared
   expert, all bf16;
-- **small unfused kernels, +1.8 ms**: hundreds per step from the MLA, sparse
+- **small unfused kernels, +1.5 ms**: hundreds per step from the MLA, sparse
   attention and DCP code paths (zero-fills, concats, casts, DCP's attention
   merge), where MiMo has three fused norms;
-- **DCP's collectives, +1.7 ms**, and **attention plus the indexer, +1.4 ms**.
+- **DCP's collectives, +1.5 ms**, and **attention plus the indexer, +1.4 ms**;
+- **the TP all-reduce, +1.1 ms**, nearly all of it GPUs waiting on the slowest
+  one, which follows the MoE's imbalance (with MTP7 it's 2.3 ms, level with
+  MiMo);
+- **the drafter, +0.2 ms**: with DFlash2 the drafter gap is gone. MTP7's seven
+  sequential passes cost 3.6 ms, against DFlash2's 1.1.
 
-Roughly half of that is structural (the drafter, the extra attention
-machinery); the other half is kernels running below what the hardware allows,
-which is where the work goes next.
+Roughly half of that is structural (the extra attention machinery); the other
+half is kernels running below what the hardware allows, which is where the
+work goes next.
 
 ## 1. Routing, and how much the HBM budget buys
 
@@ -216,6 +222,46 @@ draft passes ran as ~430 separate kernel launches every step, silently. Capturin
 size 1 as well fixed it: **-0.65 ms** *(greedy bench)*. (The profiler had
 suggested ~5 ms; the CPU was mostly launching ahead of the GPU anyway.)
 
+## 6. DFlash2 instead of MTP7
+
+DFlash2 drafts all 7 tokens in one pass of a small 6-layer model instead of
+MTP's seven sequential passes. It had been stuck on DCP1, because under DCP4
+it lost ~38% of its acceptance, and the cause had never been found.
+
+**The bug was cache addressing.** GLM's MLA pages and the drafter's pages
+can't be unified, so vLLM falls back to one cache group holding all 84 layers,
+and under DCP4 that group is sharded: each block covers 256 positions, of which
+an MLA layer keeps its GPU's 64. The drafter's KV is replicated, not sharded,
+but it still had 64-token pages and indexed the block table as if each entry
+covered 64 positions. So under DCP4 it only ever held its own KV for the first
+64 positions of a sequence. The fix gives replicated layers in a sharded group
+full 256-token pages, addressed in those units, and budgets them in the tiered
+planner. Acceptance under DCP4 now matches DCP1 request for request.
+
+On the agentic tasks, eager drafter, DCP4:
+
+| | decode step | accepted/step | decode tok/s |
+| --- | ---: | ---: | ---: |
+| MTP7 | 28.2 ms | 3.49 | 124 |
+| DFlash2 | 26.9 ms | 3.35 | 125 |
+| DFlash2, DCP1 | 35.1 ms | 3.37 | 96 |
+
+Two things stand out:
+- **DFlash2 accepts no more than MTP7 on real agentic text** (3.35 vs 3.49).
+  On GSM8K it accepts ~5.7; its edge there doesn't carry over to this workload.
+- **Its drafter is much cheaper** (1.1 ms against MTP7's 3.6), but the verify
+  pass got 1.7 ms slower. Its KV and a 10 GB HBM reserve leave 2,951 hot
+  experts per GPU against MTP7's 3,208, which shows up as more MoE time and
+  more waiting in the all-reduce (above).
+
+The drafter runs eagerly, not as a CUDA graph: capturing it costs acceptance
+(an open bug). That is not where the time is, though. The trace puts the whole
+draft pass at 188 kernels and 1.1 ms of GPU time, and the GPU waits on the host
+for only ~1 ms per step in total, so a CUDA graph could win back at most that.
+The 10 GB reserve dates from before the planner budgeted the drafter's KV; with
+that fixed, a 7-8 GB reserve should give most of the hot experts back, and is
+being measured.
+
 ## What's left
 
 From the breakdown above, the headroom is outside the MoE:
@@ -224,12 +270,13 @@ From the breakdown above, the headroom is outside the MoE:
 
   ![GEMM efficiency](figs/glm-gemm.png)
 
-- **the small unfused kernels**, ~2.3 ms of zero-fills, concats, casts and
+- **the small unfused kernels**, ~2.1-2.3 ms of zero-fills, concats, casts and
   merges that a few fused kernels could replace;
-- **the drafter**, 3.6 ms, mostly per-pass fixed costs: its biggest piece,
-  reading the 155K-token output layer seven times, is already at 93% of
-  bandwidth;
-- **DCP's collectives and the attention kernels**.
+- **the all-reduce's waiting**, 1.5-2.5 ms of GPUs waiting on the slowest one,
+  which shrinks with the MoE's imbalance and hot-set size; fusing the
+  all-reduce with the following RMSNorm is being measured;
+- **DCP's collectives and the attention kernels**, ~4 ms together;
+- **the GPU waiting on the host**, ~1 ms per step with DFlash2's eager drafter.
 
 All of it keeps the math identical: no further quantization, no change to the
 drafter or to which experts run.
