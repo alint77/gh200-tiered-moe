@@ -15,8 +15,11 @@ HBM, on one 4x GH200 node with vLLM:
 
 Both at batch one with speculative decoding. GSM8K doesn't move.
 
-**GLM-5.3** is in progress on the same node, one user, MTP7, 400K context:
-[glm/README.md](glm/README.md) tracks what was different and what it took.
+**GLM-5.3** is in progress on the same node, one user, MTP7, 400K context. On
+the same agentic coding tasks and harness as MiMo it decodes at 28.1 ms/step
+(~124 tok/s) against MiMo's 16.9 (~201), at matched acceptance:
+[glm/README.md](glm/README.md) tracks what was different, what it took, and
+where the gap is.
 
 ## The hardware
 

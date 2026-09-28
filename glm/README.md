@@ -6,17 +6,41 @@ decode step verifies 8 tokens), **400K context**. The ideas are the ones in the
 [main write-up](../README.md); this page is about what was different for GLM and
 what it took. It gets updated as work lands.
 
-| GLM-5.3, c=1, MTP7, 400K | decode step* | tok/s* |
+Both models measured the same way, on the agentic coding tasks MiMo's routing
+profile was built from (see [How it's measured](#how-its-measured)):
+
+| one user, same tasks and harness | decode step* | decode tok/s |
 | --- | ---: | ---: |
-| where this round started | 46.6 ms | ~129 |
-| now | **36.2 ms** | **~166** |
+| **GLM-5.3** W4A16, MTP7, DCP4, 400K | **28.1 ms** | **~124** |
+| MiMo-V2.6 MXFP4, DFlash k=7, 250K | 16.9 ms | ~201 |
 
-\*On a greedy bench at a matched 6 accepted tokens per step (see
-[Measuring it](#measuring-it-acceptance-gets-in-the-way)). Real Claude-Code-style
-traffic at temperature 1 accepts fewer tokens, so its tok/s is lower; the step
-time saving carries over.
+\*Fitted at a matched 3.5 accepted tokens per step and 8K context; both models
+accept 3.4-3.5 on these tasks.
 
-![decode step across the changes](figs/glm-ladder.png)
+## How it's measured
+
+Everything is measured on the same data for both models: the 16 agentic coding
+tasks (22 turns, a few hundred requests) that MiMo's routing profile was
+captured from. They're replayed through that capture's agent loop, with the
+same system prompt, tools and chat endpoint, at the models' own sampling
+(temperature 1.0, top_p 0.95). Each request's decode time, verify steps and
+accepted tokens come from the server's own counters, and step time is fitted
+against accepted tokens and context so the two models compare at the same
+point. Requests that loop to the output cap are dropped (MiMo 3 of 46, GLM
+none).
+
+**Earlier GLM numbers used a different bench, and its absolute numbers were
+wrong.** It was greedy decoding on raw completion prompts, and that text loops:
+MTP accepted 6.5-7 of 8 drafts per step, against 3.5 on the agentic tasks and
+the 2-3 you see serving Claude Code. It also routed differently: the hot set
+served 74% of its expert reads against 90% on real traffic. So its step times
+(46.6 -> 36.2 ms, "~166 tok/s") don't describe real serving, and neither did
+the "step time rises ~1.8 ms per accepted token" effect it showed. On the
+agentic tasks that effect is gone (+0.1 ms per token). Each change was still
+A/B'd against its own control on that bench, so the deltas below are real but
+were measured on looping text; they're marked *(greedy bench)*.
+
+![each change, on the greedy bench](figs/glm-ladder.png)
 
 ## How GLM differs from MiMo
 
@@ -30,17 +54,42 @@ time saving carries over.
   picks 2,048 past tokens per query and only those are read. At 400K context the
   KV cache is ~20 GiB per GPU when every GPU holds a full copy.
 - **A shared expert** runs alongside the routed ones, in bf16.
+- **A sequential drafter.** MTP7 runs its draft layer seven times, one token
+  after another; MiMo's DFlash drafts all seven in one pass.
+
+## Why MiMo is faster, on the same tasks
+
+![GLM vs MiMo per decode step](figs/glm-vs-mimo.png)
+
+Profiled on the agentic tasks, four windows per model. **The MoE costs the same
+on both** (8.2 vs 8.9 ms per step): GLM's experts are larger, but it touches
+about as many of them per step (~650 hot and ~130 cold per GPU on both), and
+at equal expert counts its INT4 kernel is within 2-7% of MiMo's MXFP4 one.
+GLM's extra ~9 ms is everything around the MoE:
+- **the drafter, +2.8 ms**: seven sequential passes against one, each reading
+  the 155K-token output layer;
+- **dense GEMMs, +2.1 ms**: GLM's MLA and indexer projections and its shared
+  expert, all bf16;
+- **small unfused kernels, +1.8 ms**: hundreds per step from the MLA, sparse
+  attention and DCP code paths (zero-fills, concats, casts, DCP's attention
+  merge), where MiMo has three fused norms;
+- **DCP's collectives, +1.7 ms**, and **attention plus the indexer, +1.4 ms**.
+
+Roughly half of that is structural (the drafter, the extra attention
+machinery); the other half is kernels running below what the hardware allows,
+which is where the work goes next.
 
 ## 1. Routing, and how much the HBM budget buys
 
-GLM's routing is skewed but flatter than you might hope: the busiest expert in a
-layer gets ~6x a uniform share, and the top half of experts takes ~81% of routes.
+Routing statistics are from the agentic tasks, ranked on some requests and
+measured on held-out ones. GLM's routing is skewed but flatter than you might
+hope: the busiest expert in a layer gets ~6x a uniform share, and the top half
+of experts takes ~81% of routes.
 
 ![expert skew](figs/glm-expert-skew.png)
 
-Ranked on some requests and measured on others, keeping each layer's most-used
-experts in HBM serves 77% of routes at the starting budget and 91% once the
-budget grows (section 4):
+Keeping each layer's most-used experts in HBM serves 72% of routes at the
+starting budget and 86% once DCP4 grows it (section 4):
 
 ![HBM coverage](figs/glm-hbm-coverage.png)
 
@@ -61,9 +110,9 @@ came straight from this:
 ## 2. Keeping the four GPUs in step: replicas
 
 After each MoE layer the four GPUs sync, so every layer costs as much as its
-busiest GPU. With GLM's cold load that was the biggest single problem: **~8 ms of
-every step was GPUs waiting** for the one with the most cold experts, and which
-GPU that was changed from layer to layer.
+busiest GPU, and which GPU is busiest changes from layer to layer. On held-out
+agentic steps, the busiest GPU reads 93 more cold experts per step than the
+average one.
 
 The fix is the same as for MiMo: keep spare copies of busy cold experts in
 another GPU's Grace memory, and at each step send an active cold expert to
@@ -75,9 +124,25 @@ work), not a real shortage.
 
 ![replicas](figs/glm-replicas.png)
 
-On held-out steps the busiest GPU's cold load drops from 128 above the average
-to 49 above it. Measured: **-4.1 ms per step.** Going from 985 to 2,000 copies
-only buys another ~0.5 ms, so we stayed at 985.
+With up to 2,000 copies per GPU the busiest GPU's excess drops from 93 to 39
+cold experts per step. Measured: **-4.1 ms per step** *(greedy bench, 985
+copies)*.
+
+### The hot set, rebuilt from the agentic tasks
+
+The first profile was ranked on Claude-Code traffic and listed 2,496 hot
+experts per GPU. Under DCP4 (section 4) a GPU holds ~3,210, and the planner
+filled the other ~715 **in expert-id order**, with no frequency information at
+all. The profile is now built from the same agentic tasks as MiMo's, ranking
+all 3,239 slots by frequency (the planner only ever trims the least-used), with
+up to 2,000 replicas per GPU. Replayed offline at the runtime budget, it cuts
+the busiest GPU's cold reads by ~20%, and by as much on the old profile's own
+Claude-Code traffic as on the agentic tasks, so the gain is from ranking the
+whole budget rather than from fitting the workload:
+
+![served vs agentic profile](figs/glm-profiles.png)
+
+Measured: **-0.94 ± 0.12 ms per step** *(greedy bench)*.
 
 ## 3. One kernel for both tiers, now for INT4
 
@@ -91,10 +156,12 @@ it was just the weight format:
   scales a thread needs in one 32-bit word.
 
 The kernel is more accurate than Marlin against an fp32 reference (error 3e-3 vs
-6-7e-3 of the row max). **On its own it bought nothing end to end**: it does
+6-7e-3 of the row max), and at equal expert counts it runs within 2-7% of the
+MXFP4 kernel MiMo uses. **On its own it bought nothing end to end**: it does
 ~2 ms less MoE work per step, but that time just became waiting on the slowest
 GPU. Once replicas were on, the kernel's other job paid off: it picks each
-replica's GPU by predicted *time* rather than expert count. **-1.4 ms more.**
+replica's GPU by predicted *time* rather than expert count. **-1.4 ms more**
+*(greedy bench)*.
 
 ## 4. DCP4: sharding the KV cache across the GPUs
 
@@ -107,16 +174,38 @@ parallelism (DCP4) each GPU keeps a quarter of it. Two things improve:
 
 The catch is three small collectives per layer (gather queries, gather softmax
 sums, scatter outputs), each ~7-12 µs through NCCL. They cost ~2.3 ms per step and
-ate most of the gain: **-1.1 ms net** at first.
+ate most of the gain: **-1.1 ms net** at first *(greedy bench)*.
 
 vLLM already has a fast path for small all-reduces: each GPU reads the others'
 buffers directly over NVLink, between two cheap barriers, in one kernel. The same
 trick works for a gather (copy instead of add) and a reduce-scatter (add only your
 own slice), reusing that path's shared buffers and CUDA-graph bookkeeping. A query
-gather dropped from 13.8 to 6.7 µs, and end to end the step got **3.1 ms faster**,
-more than the collectives' own kernel time: NCCL was also leaving gaps between
-kernels that are now gone. (vLLM's all-to-all variant of the combine measured
-within noise; NCCL's symmetric-memory kernels broke CUDA graph capture here.)
+gather dropped from 13.8 to 6.7 µs, and end to end the step got **3.1 ms faster**
+*(greedy bench)*, more than the collectives' own kernel time: NCCL was also
+leaving gaps between kernels that are now gone. (vLLM's all-to-all variant of the
+combine measured within noise; NCCL's symmetric-memory kernels broke CUDA graph
+capture here.)
+
+**On the agentic tasks, DCP4 still wins, even against a shorter context.** With
+DCP off at MiMo's 250K context, a step takes 28.8 ms against DCP4's 27.7-28.1
+at 400K (same tasks and point; prefix caching doesn't change decode, as the
+next section shows). The full MLA cache on every GPU
+leaves room for only ~2,815 hot experts against ~3,208, and the head padding
+comes back.
+
+### Prefix caching under DCP4
+
+Claude Code resends the whole conversation every turn, so prefix caching is not
+optional. Under DCP4 it crashed on the first cache hit. Sparse attention falls
+back to dense attention when the whole prompt fits in the indexer's 2,048
+tokens, and the dense path reads the cached context back through gathers that
+don't understand GLM's KV format (fp8_ds_mla: 512 fp8 values, four fp32 scales
+and 64 bf16 rope values per 656-byte entry). With DCP that failed a dtype check.
+**Without DCP it silently read garbage** (relative error ~321, with NaNs), so
+every prefix hit on a short prompt attended over corrupted context. The fix
+copies the raw entries and decodes them properly. On the agentic tasks with
+prefix caching on: no errors, a 78% cache hit rate, total prefill time 70 s
+instead of 298 s, and decode unchanged.
 
 ## 5. The drafter was running uncaptured
 
@@ -124,62 +213,41 @@ MTP drafts in 7 passes: one over 8 tokens, then six over a single token each.
 vLLM only builds a CUDA graph for the single-token passes if the capture sizes
 include a size that fits one user, and ours listed only 8. So six of the seven
 draft passes ran as ~430 separate kernel launches every step, silently. Capturing
-size 1 as well fixed it: **-0.65 ms.** (The profiler had suggested ~5 ms; the CPU
-was mostly launching ahead of the GPU anyway.)
+size 1 as well fixed it: **-0.65 ms** *(greedy bench)*. (The profiler had
+suggested ~5 ms; the CPU was mostly launching ahead of the GPU anyway.)
 
-## Measuring it: acceptance gets in the way
+## What's left
 
-Each configuration is measured on the same prompts with greedy decoding, arms
-alternated across two nodes. Two things make that harder than it sounds:
-- greedy output isn't reproducible here, so the number of draft tokens accepted
-  per step varies run to run;
-- **step time rises with the number of accepted tokens**, even though the verify
-  is always 8 tokens: a step whose 7 drafts are all accepted takes ~3.7 ms longer
-  than one where none are. Logging every step shows it follows the *text* more
-  than the step: stretches of predictable text accept well and also verify
-  slower, most likely because 8 coherent tokens touch more distinct experts
-  (and more cold ones) than a batch that's rejected early.
-
-So every comparison is a fit at matched acceptance:
-
-![A/B runs](figs/glm-ab-runs.png)
-
-## Where a step goes now
-
-![step breakdown](figs/glm-step-breakdown.png)
-
-The two captures happened to accept very different numbers of draft tokens (2.3
-vs 6.6 per step), and a step whose drafts are mostly accepted is the slower kind
-(see above), so the lower bar is the harder case and still comes in at 39.9 ms
-against 57.2 (profiled; the profiler adds a few ms). The all-reduces, which are
-mostly GPUs waiting on each other, fell from 11.8 to 3.6 ms, and the idle gaps
-from 5.5 to 2.3. What's left, roughly in order:
-- **the MoE itself** is now mostly the cold experts' C2C reads plus the hot tier;
-- **dense GEMMs** at 8 tokens run at 40-78% of the HBM read floor, ~1.5 ms to gain:
+From the breakdown above, the headroom is outside the MoE:
+- **the 8-token dense GEMMs** run at 40-78% of the HBM read floor, ~1.5 ms to
+  gain. A first bf16 weight-streaming kernel is correct but slower than cuBLAS;
 
   ![GEMM efficiency](figs/glm-gemm.png)
 
-- **DCP's collectives**, now ~1.6 ms;
-- **the drafter**, ~3.8 ms; its biggest piece is reading the 155K-token output
-  layer seven times, which is already at 93% of bandwidth;
-- the acceptance-dependent cost above, which comes with the text rather than
-  with any one kernel.
+- **the small unfused kernels**, ~2.3 ms of zero-fills, concats, casts and
+  merges that a few fused kernels could replace;
+- **the drafter**, 3.6 ms, mostly per-pass fixed costs: its biggest piece,
+  reading the 155K-token output layer seven times, is already at 93% of
+  bandwidth;
+- **DCP's collectives and the attention kernels**.
 
-## Being worked on
-
-- A bf16 kernel for the 8-token dense GEMMs. The production kernels take ~5.8 ms
-  per step against a ~3 ms read floor. A first weight-streaming version is
-  correct but slower than cuBLAS; it's being profiled.
+All of it keeps the math identical: no further quantization, no change to the
+drafter or to which experts run.
 
 ## Accuracy
 
-GSM8K, the same 1,000 questions on both setups: **91.2% now against 91.4%
-before**, a difference of -0.2 points (95% interval -1.4 to +1.0). The two get
-different questions right about equally often (18 vs 20), which is what noise
-looks like.
+GSM8K, four full runs of each setup pooled over the 1,000 questions they share:
+**91.0% now against 91.4% before**, a difference of -0.3 points (95% interval
+-0.9 to +0.3). Greedy decoding isn't reproducible here: the old setup changes
+~43 answers against itself from run to run, so a single paired run can't
+resolve differences below ~1.3 points. No detectable regression.
 
 ## Where the data is
 
-Raw data, scripts and every run: the worklog's
-`experiments/2026-09-27-glm53-mtp7-profile` (figures from `plot_glm.py`,
-A/B fits from `fit_ab.py`).
+Raw data, scripts and every run are in the worklog:
+- `experiments/2026-09-28-agentic-decode-bench`: the agentic-task harness, both
+  models' runs and profiles, DCP off, and the prefix-caching fix;
+- `experiments/2026-09-28-glm53-route-cap`: the agentic-task routing capture and
+  the rebuilt profile;
+- `experiments/2026-09-27-glm53-mtp7-profile`: the greedy-bench A/Bs, GSM8K, and
+  the figures (`plot_glm.py`).
