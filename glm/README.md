@@ -1,8 +1,8 @@
 # GLM-5.3 on the tiered MoE path
 
 A running log of serving **GLM-5.3 W4A16** on one 4x GH200 node, at the shape
-we actually use: one user at a time, **MTP with 7 draft tokens** (so every
-decode step verifies 8 tokens), **400K context**. The ideas are the ones in the
+we actually use: one user at a time, **7 draft tokens** (DFlash2 now, MTP
+before; every decode step verifies 8 tokens), **400K context**. The ideas are the ones in the
 [main write-up](../README.md); this page is about what was different for GLM and
 what it took. It gets updated as work lands.
 
@@ -12,7 +12,8 @@ profile was built from (see [How it's measured](#how-its-measured)):
 | one user, same tasks and harness | decode step* | accepted/step | decode tok/s |
 | --- | ---: | ---: | ---: |
 | **GLM-5.3** W4A16, MTP7, DCP4, 400K | **28.1 ms** | 3.49 | **~124** |
-| **GLM-5.3** W4A16, DFlash2 (eager draft), DCP4, 400K | 26.9 ms | 3.35 | ~125 |
+| **GLM-5.3** W4A16, DFlash2 (eager draft), DCP4, 400K | 25.9 ms | 3.25 | ~125 |
+| **GLM-5.3**, DFlash2, after the verify-step kernel work ([7](#7-kernel-work-on-the-verify-step-dflash2-dcp4-reserve-7)) | **24.4 ms** | 3.46 | **~142** |
 | MiMo-V2.6 MXFP4, DFlash k=7, 250K | 16.9 ms | 3.53 | ~201 |
 
 \*Fitted at matched acceptance and 8K context; tok/s is step-weighted over the
@@ -256,27 +257,65 @@ Two things stand out:
 
 The drafter runs eagerly, not as a CUDA graph: capturing it costs acceptance
 (an open bug). That is not where the time is, though. The trace puts the whole
-draft pass at 188 kernels and 1.1 ms of GPU time, and the GPU waits on the host
-for only ~1 ms per step in total, so a CUDA graph could win back at most that.
-The 10 GB reserve dates from before the planner budgeted the drafter's KV; with
-that fixed, a 7-8 GB reserve should give most of the hot experts back, and is
-being measured.
+draft pass at 188 kernels and 1.1 ms of GPU time, and under Nsight Systems the
+GPU is idle only ~0.3 ms per step (section 7), so a CUDA graph could win back
+little. The 10 GB reserve dates from before the planner budgeted the drafter's
+KV; with that fixed, DFlash2 serves at MTP7's 7 GB reserve (free HBM stays flat
+at ~6.5 GiB over the task set) and its step drops to **25.9 ms** (fitted), now
+the serving default and the starting point for section 7.
+
+## 7. Kernel work on the verify step (DFlash2, DCP4, reserve 7)
+
+**The host is not the bottleneck.** Under the torch profiler some steps seemed to
+stall 1-11 ms waiting on one GPU's host, but that was the profiler's own
+per-kernel overhead. Under Nsight Systems with graph-level tracing the GPU is
+busy ~99% of the step (0.3 ms idle), the four GPUs enter each step within
+~18 us of each other, and launching the verify graph takes 0.3 ms. So all the
+remaining time is kernels.
+
+Five changes, each with identical output (bitwise, or checked equal in the
+served model), each A/B'd on the agentic tasks against its own control:
+
+| change | step time, paired (95% CI) |
+| --- | ---: |
+| DCP4: query concat + gather, and the attention combine (LSE gather, correction, reduce-scatter), each fused into one kernel on the custom all-reduce buffers | -0.22 ms (-0.45 to -0.03) |
+| sparse-attention index conversion: one program per row (upstream #50365), no zero/-1 fills; the combine reads the LSE in place, dropping a mask that could not change the result | -0.65 ms (-0.87 to -0.42) |
+| the 57 of 78 layers that reuse another layer's top-k reuse its converted indices too; the MoE route kernel drops padded tokens itself | -0.79 ms (-0.93 to -0.64) |
+| **all of the above, against the start** | **-1.76 ms (-2.00 to -1.50)** |
+
+![verify-step kernel changes](figs/glm-verify-changes.png)
+
+Step time goes **26.0 -> 24.3 ms** on the task set and **25.6 -> 23.7 ms**
+unprofiled (nsys); kernels in the verify graph drop from 3,407 to 2,576 per
+step. At the same acceptance that is **~133 -> ~142 decode tok/s**.
+
+**Fusing the all-reduce with the next RMSNorm** crashed before because these
+GPUs are linked directly, without NVSwitch, so NVLink multicast is unavailable,
+yet vLLM's auto choice was FlashInfer's multicast backend. With the right
+backend it runs (and needed a compile fix for DFlash2's selector), but gains
+only -0.15 ms (-0.36 to +0.00): FlashInfer's fused all-reduce is slower than
+vLLM's own (5.5 vs 4.2 us per call), eating half of what dropping the norm
+saves. Not enabled.
+
+![all-reduce: work vs waiting](figs/glm-allreduce.png)
+
+**What the all-reduce really costs is waiting**: ~2 ms per step of GPUs idle
+at the ~150 all-reduces until the slowest one arrives, against ~0.7 ms of
+actual transfer. That is MoE imbalance, and more replicas cannot fix it: every
+cold expert already has a second holder, and even letting any cold expert run
+on any GPU would save at most ~10 cold reads per step on the busiest GPU. The
+imbalance is in the pinned hot experts (~868 on the busiest GPU per step
+against ~663 on average), which is what an ownership rebalance would target.
+
+![where the MoE imbalance comes from](figs/glm-imbalance.png)
 
 ## What's left
 
-From the breakdown above, the headroom is outside the MoE:
-- **the 8-token dense GEMMs** run at 40-78% of the HBM read floor, ~1.5 ms to
-  gain. A first bf16 weight-streaming kernel is correct but slower than cuBLAS;
-
-  ![GEMM efficiency](figs/glm-gemm.png)
-
-- **the small unfused kernels**, ~2.1-2.3 ms of zero-fills, concats, casts and
-  merges that a few fused kernels could replace;
-- **the all-reduce's waiting**, 1.5-2.5 ms of GPUs waiting on the slowest one,
-  which shrinks with the MoE's imbalance and hot-set size; fusing the
-  all-reduce with the following RMSNorm is being measured;
-- **DCP's collectives and the attention kernels**, ~4 ms together;
-- **the GPU waiting on the host**, ~1 ms per step with DFlash2's eager drafter.
+- **hot-expert imbalance**, ~2 ms/step of all-reduce waiting: re-choose which
+  GPU owns which hot experts (a profile rebuild, same math);
+- **the 8-token dense GEMMs and their split-K reduce kernels**, ~0.3-0.5 ms;
+- **the sampler's top-p kernel**, 0.2 ms on 8 of 132 SMs;
+- **DCP's collectives and the attention kernels**, now ~3 ms together.
 
 All of it keeps the math identical: no further quantization, no change to the
 drafter or to which experts run.
@@ -297,4 +336,6 @@ Raw data, scripts and every run are in the worklog:
 - `experiments/2026-09-28-glm53-route-cap`: the agentic-task routing capture and
   the rebuilt profile;
 - `experiments/2026-09-27-glm53-mtp7-profile`: the greedy-bench A/Bs, GSM8K, and
-  the figures (`plot_glm.py`).
+  the figures (`plot_glm.py`);
+- `experiments/2026-09-29-glm-verify-kernels`: the kernel work in section 7,
+  its traces, tests and A/Bs.

@@ -15,10 +15,11 @@ HBM, on one 4x GH200 node with vLLM:
 
 Both at batch one with speculative decoding. GSM8K doesn't move.
 
-**GLM-5.3** is in progress on the same node, one user, MTP7, 400K context. On
+**GLM-5.3** is in progress on the same node, one user, 7 draft tokens, 400K context. On
 the same agentic coding tasks and harness as MiMo it decodes at 28.1 ms/step
-(~124 tok/s) against MiMo's 16.9 (~201), at matched acceptance; with a DFlash2
-drafter, now working under DCP4, it is level at ~125 tok/s:
+(~124 tok/s) against MiMo's 16.9 (~201), at matched acceptance. With a DFlash2
+drafter, now working under DCP4, and a round of kernel work on the verify step
+(same outputs), it is at 24.4 ms/step (~142 tok/s):
 [glm/README.md](glm/README.md) tracks what was different, what it took, and
 where the gap is.
 
