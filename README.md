@@ -19,7 +19,8 @@ Both at batch one with speculative decoding. GSM8K doesn't move.
 the same agentic coding tasks and harness as MiMo it decodes at 28.1 ms/step
 (~124 tok/s) against MiMo's 16.9 (~201), at matched acceptance. With a DFlash2
 drafter, now working under DCP4, and a round of kernel work on the verify step
-(same outputs), it is at 24.4 ms/step (~142 tok/s):
+(same outputs), plus a fused all-reduce/RMSNorm, it is at ~24.0 ms/step
+(~144 tok/s):
 [glm/README.md](glm/README.md) tracks what was different, what it took, and
 where the gap is.
 

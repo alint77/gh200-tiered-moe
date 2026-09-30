@@ -14,10 +14,13 @@ profile was built from (see [How it's measured](#how-its-measured)):
 | **GLM-5.3** W4A16, MTP7, DCP4, 400K | **28.1 ms** | 3.49 | **~124** |
 | **GLM-5.3** W4A16, DFlash2 (eager draft), DCP4, 400K | 25.9 ms | 3.25 | ~125 |
 | **GLM-5.3**, DFlash2, after the verify-step kernel work ([7](#7-kernel-work-on-the-verify-step-dflash2-dcp4-reserve-7)) | **24.4 ms** | 3.46 | **~142** |
+| **GLM-5.3**, + fused all-reduce/RMSNorm (now default) | **~24.0 ms**† | | **~144**† |
 | MiMo-V2.6 MXFP4, DFlash k=7, 250K | 16.9 ms | 3.53 | ~201 |
 
 \*Fitted at matched acceptance and 8K context; tok/s is step-weighted over the
-whole task set. All three accept 3.3-3.5 tokens per step on these tasks.
+whole task set. †The row above minus the fusion's same-node saving
+(0.44 ms), at the same acceptance. All accept 3.3-3.5 tokens per step on these
+tasks.
 
 ## How it's measured
 
@@ -292,10 +295,21 @@ step. At the same acceptance that is **~133 -> ~142 decode tok/s**.
 **Fusing the all-reduce with the next RMSNorm** crashed before because these
 GPUs are linked directly, without NVSwitch, so NVLink multicast is unavailable,
 yet vLLM's auto choice was FlashInfer's multicast backend. With the right
-backend it runs (and needed a compile fix for DFlash2's selector), but gains
-only -0.15 ms (-0.36 to +0.00): FlashInfer's fused all-reduce is slower than
-vLLM's own (5.5 vs 4.2 us per call), eating half of what dropping the norm
-saves. Not enabled.
+backend it runs (and needed a compile fix for DFlash2's selector). Measured
+against the unfused build **on the same node** (four nodes, each running both),
+it saves **0.44 ms per step (95% CI 0.28 to 0.59)** with acceptance unchanged,
+and it is now the default. A first estimate that compared arms on different
+nodes said only -0.15 ms: at this size the node-to-node spread swamps the
+effect, so every comparison since is paired within a node. FlashInfer's fused
+all-reduce is still slower than vLLM's own (5.5 vs 4.2 us per call), which
+costs part of what dropping the norm kernels saves. Unlike the changes above,
+the fusion is not bitwise: it sums in a different order.
+
+**Running the sparse-attention indexer on a second CUDA stream** (the idea of
+upstream vllm#47355, with the DCP gather kept on the main stream so collectives
+keep one order) did not pay: -0.13 ms (-0.34 to +0.07), same-node pairs. The
+part that can move off the critical path is small, and the indexer's
+cross-GPU merge stays serial. Not adopted.
 
 ![all-reduce: work vs waiting](figs/glm-allreduce.png)
 
@@ -313,6 +327,8 @@ against ~663 on average), which is what an ownership rebalance would target.
 
 - **hot-expert imbalance**, ~2 ms/step of all-reduce waiting: re-choose which
   GPU owns which hot experts (a profile rebuild, same math);
+- **DFlash2's context projection**, 0.14 ms/step, could overlap the sampler,
+  which runs on 8 of 132 SMs;
 - **the 8-token dense GEMMs and their split-K reduce kernels**, ~0.3-0.5 ms;
 - **the sampler's top-p kernel**, 0.2 ms on 8 of 132 SMs;
 - **DCP's collectives and the attention kernels**, now ~3 ms together.
