@@ -6,6 +6,9 @@ before; every decode step verifies 8 tokens), **400K context**. The ideas are th
 [main write-up](../README.md); this page is about what was different for GLM and
 what it took. It gets updated as work lands.
 
+Prefill has its own page: [GLM-5.3 prefill](prefill/README.md) (TTFT at the
+agentic shape 3.43-3.49 -> 2.75-2.83 s).
+
 Both models measured the same way, on the agentic coding tasks MiMo's routing
 profile was built from (see [How it's measured](#how-its-measured)):
 
