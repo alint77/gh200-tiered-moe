@@ -392,7 +392,7 @@ them. Each GPU still got a 2,048-wide index row: its own ~512 compacted to the
 front, -1 after. FlashMLA's sm90 kernel gives a -1 no shortcut (it loads a
 row, dequantizes it, runs both GEMMs and masks it in the softmax), and its
 early stop isn't supported for this KV format. The index conversion now
-writes 768-wide rows (`VLLM_DCP_SPARSE_DECODE_WIDTH`, opt-in): 21.4 -> 16.8 µs
+writes 768-wide rows (`VLLM_DCP_SPARSE_DECODE_WIDTH`, now the default): 21.4 -> 16.8 µs
 per layer. A row with more live slots than that would lose keys, so the same
 kernel counts them; in serving the most seen was 597, never over 768.
 
