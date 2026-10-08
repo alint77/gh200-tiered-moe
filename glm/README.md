@@ -449,33 +449,38 @@ Served at c=4 with a 7-token drafter (3 nodes, before/after on each): the
 16-token step -3.3 ms (-10%), the 32-token step -4.3 to -4.8 ms (-10%), the
 8-token step unchanged; total throughput +8-11%.
 
-**How far concurrency goes** (decode tok/s per request / total, 5K and 50K
-contexts averaged; 4 tokens verified per request):
+**How far concurrency goes** at full 400K context per request (decode tok/s
+per request / total, 5K and 50K contexts averaged; 4 tokens verified per
+request):
 
-| config | hot / GPU | 1 in flight | 2 | 4 | 8 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| c=2, MTP3 | 3,550 | 165 / 153 | 127 / 228 | | |
-| c=2, DFlash2 k=3 | 3,591 | 158 / 148 | 125 / 223 | | |
-| c=4, MTP3 | 3,382 | 154 / 143 | 125 / 221 | 96 / 331 | |
-| c=4, DFlash2 k=3 | 3,429 | 148 / 138 | 121 / 213 | 95 / 331 | |
-| c=8 at 200K, MTP3 | 3,381 | 155 / 144 | 123 / 218 | 94 / 322 | **65 / 439** |
-| c=8 at 200K, DFlash2 k=3 | 3,427 | 147 / 138 | 118 / 214 | 93 / 323 | **65 / 432** |
-| c=8 at 400K, 500 replicas, MTP3 | 3,044 | 132 / 123 | 101 / 182 | 78 / 274 | 55 / 369 |
-| c=8 at 400K, 500 replicas, DFlash2 k=3 | 3,108 | 131 / 123 | 101 / 182 | 78 / 281 | 54 / 367 |
-| c=8 at 400K, no replicas, DFlash2 k=3 | 3,108 | 124 / 116 | 97 / 172 | 72 / 253 | 51 / 340 |
+| config | KV pool | hot / GPU | 1 in flight | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| c=2, MTP3 | 0.8M | 3,550 | 165 / 153 | 127 / 228 | | |
+| c=2, DFlash2 k=3 | 0.8M | 3,591 | 158 / 148 | 125 / 223 | | |
+| c=4, MTP3 | 1.6M | 3,382 | 154 / 143 | 125 / 221 | 96 / 331 | |
+| c=4, DFlash2 k=3 | 1.6M | 3,429 | 148 / 138 | 121 / 213 | 95 / 331 | |
+| **c=8, MTP3** | **1.6M** | 3,381 | 152 / 142 | 126 / 226 | 97 / 337 | **66 / 444** |
+| **c=8, DFlash2 k=3** | **1.6M** | 3,428 | 144 / 134 | 120 / 216 | 96 / 333 | **65 / 430** |
+| c=8, MTP3, 1,000 replicas | 3.2M | 3,044 | 135 / 126 | 106 / 191 | 81 / 285 | 55 / 377 |
+| c=8, DFlash2 k=3, 1,000 replicas | 3.2M | 3,108 | 134 / 125 | 103 / 189 | 81 / 279 | 55 / 376 |
+| c=8, DFlash2 k=3, 500 replicas | 3.2M | 3,108 | 131 / 123 | 101 / 182 | 78 / 281 | 54 / 367 |
 
 ![throughput vs requests in flight](figs/glm-concurrency.png)
 
-- **c=4 doubles throughput, c=8 nearly triples it** (~330 and ~435 tok/s
-  against ~165 for one user), at ~95 and ~65 tok/s per request.
-- **MTP3 and DFlash2 k=3 are level** at every size: MTP3 accepts a little
-  more, DFlash2's step is a little shorter. MTP3 needs a 3.6 GB HBM reserve
-  (the planner under-counts its layer) where DFlash2 runs at 1.7.
-- **c=8 at full 400K does not fit Grace** with prod's 1,350-1,960 replicas
-  per GPU: 8 x 400K of skip-layer and drafter KV plus the extra cold experts
-  exceed it. Fewer hot experts would not help (each one moved out of HBM
-  lands on Grace). With 500 replicas it fits and costs 15% against c=8 at
-  200K (367 vs 432); with none, 21%.
+- **The KV pool no longer has to be c x 400K.** The planner used to provision
+  max_num_seqs full-length sequences, so c=8 meant a 3.2M-token pool: ~320
+  fewer hot experts per GPU and, with that much KV on Grace, no room for the
+  usual 1,350-1,960 cold replicas (it fit only with 500-1,000). A shared pool
+  sized in sequences (`VLLM_TIERED_MOE_KV_POOL_SEQS`, here 4 = 1.6M tokens)
+  lets 8 requests of up to 400K each share what 4 would have had; vLLM
+  preempts if their combined context outgrows it.
+- **c=4 doubles throughput, c=8 reaches ~440 tok/s** (against ~165 for one
+  user), at ~95 and ~65 tok/s per request. On the 1.6M pool c=8 keeps c=4's
+  hot set and replicas, so a lone request runs about as fast as under c=4.
+- **MTP3 and DFlash2 k=3 are level** on this text: MTP3 accepts a little more,
+  DFlash2's step is a little shorter (section 11 for other text). MTP3 needs a
+  3.6 GB HBM reserve (the planner under-counts its layer) where DFlash2 runs
+  at 1.7.
 
 ## 11. MTP3 vs DFlash2 away from code
 

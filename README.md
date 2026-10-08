@@ -23,7 +23,7 @@ drafter, now working under DCP4, and a round of kernel work on the verify step
 (~144 tok/s). Freeing HBM for hot experts (+496 per GPU, mostly by moving memory to Grace) and
 a round of decode micro-optimizations take it to **~21.0 ms/step (~168 tok/s)**
 for one user; with up to 32 tokens per decode step it serves 4 users at ~330
-tok/s and 8 at ~435 (200K context each):
+tok/s and 8 at ~440, each with 400K of context on a shared KV pool:
 [glm/README.md](glm/README.md) tracks what was different, what it took, and
 where the gap is.
 
