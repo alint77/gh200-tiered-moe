@@ -416,6 +416,67 @@ replay), and folding the shared expert into the MoE kernel (the MoE is
 C2C-bound with SMs to spare, and the shared expert already hides on its side
 stream).
 
+## 10. More than one user: 8 -> 32 tokens per step
+
+With c concurrent requests the verify step carries c x (draft + 1) tokens.
+Everything built for decode stopped at 8, so c=2 / c=4 / c=8 with a 3-token
+drafter (8 / 16 / 32 tokens) fell back to paths made for other jobs:
+
+| gate | at 8 | above 8, the server ran | now |
+| --- | --- | --- | --- |
+| tiered decode MoE | one kernel, both tiers | the wgmma prefill MoE | up to 32 tokens |
+| decode GEMMs | `decode_gemm` | cuBLAS | up to 32, configs per size |
+| skip-layer KV staging | staged into HBM | **the 57 skip layers' attention reading KV over C2C** | up to 32 queries |
+| `max_num_seqs` | 1-4 allowed | refused | 1-8 |
+
+**MoE.** Replaying live Claude Code routing at 16 / 32 tokens (2 / 4
+concurrent requests): at the 95th percentile a GPU runs ~37 hot and ~6 cold
+experts per layer, and only 1.2% of experts get more than 8 tokens.
+So a list entry keeps at most 8 tokens (the MMA's N; the shared-memory stages
+are unchanged) and route-prep gives an expert with more several entries.
+
+![MoE layer at 16 and 32 tokens](figs/glm-m32-moe.png)
+
+**GEMMs.** `decode_gemm` takes 1-4 tiles of 8 tokens, each weight fragment
+feeding all of them: 2-17% under cuBLAS at 9-16 tokens, still 5-11% on o_proj
+and the dense MLP at 32; q_b past 16 and fused qkv_a at 32 stay on cuBLAS,
+which is level there. **Staging** buffers are sized to the config (queries x
+the 768-wide index rows), which also frees 20 MB at c=1.
+
+![served step time before and after](figs/glm-m32-ab.png)
+
+Served at c=4 with a 7-token drafter (3 nodes, before/after on each): the
+16-token step -3.3 ms (-10%), the 32-token step -4.3 to -4.8 ms (-10%), the
+8-token step unchanged; total throughput +8-11%.
+
+**How far concurrency goes** (decode tok/s per request / total, 5K and 50K
+contexts averaged; 4 tokens verified per request):
+
+| config | hot / GPU | 1 in flight | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| c=2, MTP3 | 3,550 | 165 / 153 | 127 / 228 | | |
+| c=2, DFlash2 k=3 | 3,591 | 158 / 148 | 125 / 223 | | |
+| c=4, MTP3 | 3,382 | 154 / 143 | 125 / 221 | 96 / 331 | |
+| c=4, DFlash2 k=3 | 3,429 | 148 / 138 | 121 / 213 | 95 / 331 | |
+| c=8 at 200K, MTP3 | 3,381 | 155 / 144 | 123 / 218 | 94 / 322 | **65 / 439** |
+| c=8 at 200K, DFlash2 k=3 | 3,427 | 147 / 138 | 118 / 214 | 93 / 323 | **65 / 432** |
+| c=8 at 400K, 500 replicas, MTP3 | 3,044 | 132 / 123 | 101 / 182 | 78 / 274 | 55 / 369 |
+| c=8 at 400K, 500 replicas, DFlash2 k=3 | 3,108 | 131 / 123 | 101 / 182 | 78 / 281 | 54 / 367 |
+| c=8 at 400K, no replicas, DFlash2 k=3 | 3,108 | 124 / 116 | 97 / 172 | 72 / 253 | 51 / 340 |
+
+![throughput vs requests in flight](figs/glm-concurrency.png)
+
+- **c=4 doubles throughput, c=8 nearly triples it** (~330 and ~435 tok/s
+  against ~165 for one user), at ~95 and ~65 tok/s per request.
+- **MTP3 and DFlash2 k=3 are level** at every size: MTP3 accepts a little
+  more, DFlash2's step is a little shorter. MTP3 needs a 3.6 GB HBM reserve
+  (the planner under-counts its layer) where DFlash2 runs at 1.7.
+- **c=8 at full 400K does not fit Grace** with prod's 1,350-1,960 replicas
+  per GPU: 8 x 400K of skip-layer and drafter KV plus the extra cold experts
+  exceed it. Fewer hot experts would not help (each one moved out of HBM
+  lands on Grace). With 500 replicas it fits and costs 15% against c=8 at
+  200K (367 vs 432); with none, 21%.
+
 ## What's left
 
 ![where the step goes now](figs/glm-step-now.png)
@@ -459,3 +520,5 @@ Raw data, scripts and every run are in the worklog:
   `2026-10-08-flashmla-split`: section 9;
 - `experiments/2026-10-08-decode-dive-3`: the step breakdown and these
   sections' figures (`plot_micro.py`).
+- `experiments/2026-10-08-m32`: section 10: routing replay, kernel grids,
+  the served A/B, the concurrency sweep and its figures (`plot_m32.py`).
