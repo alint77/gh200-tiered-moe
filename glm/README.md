@@ -18,12 +18,16 @@ profile was built from (see [How it's measured](#how-its-measured)):
 | **GLM-5.3** W4A16, DFlash2 (eager draft), DCP4, 400K | 25.9 ms | 3.25 | ~125 |
 | **GLM-5.3**, DFlash2, after the verify-step kernel work ([7](#7-kernel-work-on-the-verify-step-dflash2-dcp4-reserve-7)) | **24.4 ms** | 3.46 | **~142** |
 | **GLM-5.3**, + fused all-reduce/RMSNorm (now default) | **~24.0 ms**† | | **~144**† |
+| **GLM-5.3**, + more hot experts and decode kernel work ([8](#8-more-of-hbm-for-hot-experts), [9](#9-decode-micro-optimizations)) | **~21.0 ms**‡ | 3.54 | **~168**‡ |
 | MiMo-V2.6 MXFP4, DFlash k=7, 250K | 16.9 ms | 3.53 | ~201 |
 
 \*Fitted at matched acceptance and 8K context; tok/s is step-weighted over the
 whole task set. †The row above minus the fusion's same-node saving
-(0.44 ms), at the same acceptance. All accept 3.3-3.5 tokens per step on these
-tasks.
+(0.44 ms), at the same acceptance. ‡Mean step over the same task set in the
+section 9 A/B (21.47 ms at full index width, minus that change's 0.47 ms), at
+the pooled 3.54 accepted tokens per step; not the 8K fit of the rows above. The
+paired deltas of sections 8-9 sum to about -2 ms. All accept 3.3-3.6 tokens per
+step on these tasks.
 
 ## How it's measured
 
@@ -262,7 +266,7 @@ Two things stand out:
   more waiting in the all-reduce (above).
 
 The drafter runs eagerly, not as a CUDA graph: capturing it costs acceptance
-(an open bug). That is not where the time is, though. The trace puts the whole
+(an open bug, since gone: section 9). That is not where the time is, though. The trace puts the whole
 draft pass at 188 kernels and 1.1 ms of GPU time, and under Nsight Systems the
 GPU is idle only ~0.3 ms per step (section 7), so a CUDA graph could win back
 little. The 10 GB reserve dates from before the planner budgeted the drafter's
@@ -326,15 +330,106 @@ against ~663 on average), which is what an ownership rebalance would target.
 
 ![where the MoE imbalance comes from](figs/glm-imbalance.png)
 
+## 8. More of HBM for hot experts
+
+A GiB of HBM holds ~50 INT4 experts, and every hot expert is one less read over
+C2C. Four changes, none touching the math, took the hot set from **3,180 to
+3,676 experts per GPU**:
+
+- **Skip-layer KV on Grace.** 57 of the 78 layers reuse the top-k of the
+  indexer layer before them. Their MLA KV (3.5 GiB per GPU at 400K) now lives
+  on Grace. Right after that indexer layer's attention, a side stream copies
+  the rows its top-k picked (~600 per GPU, ~23 MB per step) into an HBM
+  staging buffer, so those layers still read HBM; the copy is done ~100 µs
+  before it's needed.
+- **fp8 drafter weights and KV** (acceptance unchanged), and **the drafter's KV
+  on Grace**: its 2,048-token sliding window reads over C2C for +19 µs per step.
+- **Memory nobody needed**: DCP's prefill workspaces sized to what they hold
+  (-2.15 GiB), one NCCL communicator shared by the TP, DCP and EP groups that
+  span the same GPUs (-0.94 GiB), and the input embedding on Grace (a step
+  gathers 8 rows; -0.44 GiB). That let the planned HBM reserve drop from 4.7
+  to 1.7 GB with the startup free-memory check still passing.
+- **Promote the right experts.** The profile ranks 3,239 hot experts per GPU;
+  the planner filled the slots past that in expert-id order. The profile now
+  lists the rest by route frequency on live Claude Code traffic. Same count,
+  better experts.
+
+![hot experts per GPU](figs/glm-hot-experts.png)
+
+| change | agentic tasks | 50K / 130K decode |
+| --- | ---: | ---: |
+| skip-layer KV + fp8 drafter + drafter KV on Grace (one node, short runs) | -0.54 ms (-0.74 to -0.34) | |
+| reclaimed workspaces / communicator / embedding, reserve 1.7 | -0.22 ms (-0.28 to -0.16) | -0.27 ms (-0.33 to -0.20) |
+| frequency-ordered promotion | -0.20 ms (-0.25 to -0.15) | -0.32 ms (-0.38 to -0.27) |
+
+Paired step-time deltas, 95% CI; GSM8K unchanged in each.
+
+## 9. Decode micro-optimizations
+
+**The 8-token GEMMs on our own kernel.** At 8 tokens a bf16 GEMM only streams
+its weights, and cuBLAS got 52-62% of the HBM floor on GLM's attention
+projections. `decode_gemm` gives each 16-row tile 4 warps, each over a long K,
+with double-buffered 16-byte loads into `mma.m16n8k16` (the 8 tokens as N).
+All verify-step linears together: 5.31 -> 4.53 ms in isolation. The shared
+expert stays on cuBLAS: on its side stream our kernel fills every SM and
+delays the MoE. Two things that didn't work: prefetching o_proj's weights into
+L2 (no idle bandwidth window long enough) and a TMA ring (at these sizes TMA
+streams start ~4.6 µs later than plain loads).
+
+![decode GEMMs](figs/glm-decode-gemm.png)
+
+**The DFlash2 drafter as a CUDA graph.** Section 6 left it eager because the
+captured graph cost 44% of acceptance. On the current stack the replay is
+bit-identical to eager: hidden states, candidates, selector scores and tokens
+at every probed step, so one of the DCP-port fixes most likely removed the
+cause. Captured now. It's worth only 0.09 ms because the eager drafter was
+already GPU-bound; profiles had promised more, but the profiler's per-launch
+cost inflates eager regions.
+
+**Narrower sparse-attention index rows under DCP4.** Each query attends to the
+2,048 tokens the indexer picked, and under DCP4 a GPU owns about a quarter of
+them. Each GPU still got a 2,048-wide index row: its own ~512 compacted to the
+front, -1 after. FlashMLA's sm90 kernel gives a -1 no shortcut (it loads a
+row, dequantizes it, runs both GEMMs and masks it in the softmax), and its
+early stop isn't supported for this KV format. The index conversion now
+writes 768-wide rows (`VLLM_DCP_SPARSE_DECODE_WIDTH`, opt-in): 21.4 -> 16.8 µs
+per layer. A row with more live slots than that would lose keys, so the same
+kernel counts them; in serving the most seen was 597, never over 768.
+
+![index width](figs/glm-dcp-width.png)
+
+![decode changes](figs/glm-decode-changes.png)
+
+| change | agentic tasks | 50K / 130K decode | GSM8K |
+| --- | ---: | ---: | ---: |
+| `decode_gemm` for the 8-token dense GEMMs | -0.47 ms (-0.52 to -0.42) | -0.50 ms (-0.57 to -0.43) | 91.4 -> 92.1% |
+| drafter as a CUDA graph | -0.09 ms (-0.14 to -0.04) | -0.07 ms (-0.13 to -0.02) | 90.9 -> 91.4% |
+| 768-wide index rows | -0.47 ms (-0.52 to -0.42)§ | -0.48 ms (-0.52 to -0.44) | 91.3 -> 91.9% |
+
+§Two short requests excluded, one in each arm, that stalled at 72 and 120
+ms/step (cause not found); with them, -0.38 ms (-0.93 to +0.16). The drafter
+graph's output is bitwise equal; the two kernel changes sum in a different
+order, so they match to bf16 rounding.
+
+Not adopted: a GLM-specific cost table for the replica balancer (-0.05 ms in
+replay), and folding the shared expert into the MoE kernel (the MoE is
+C2C-bound with SMs to spare, and the shared expert already hides on its side
+stream).
+
 ## What's left
 
-- **hot-expert imbalance**, ~2 ms/step of all-reduce waiting: re-choose which
-  GPU owns which hot experts (a profile rebuild, same math);
-- **DFlash2's context projection**, 0.14 ms/step, could overlap the sampler,
-  which runs on 8 of 132 SMs;
-- **the 8-token dense GEMMs and their split-K reduce kernels**, ~0.3-0.5 ms;
-- **the sampler's top-p kernel**, 0.2 ms on 8 of 132 SMs;
-- **DCP's collectives and the attention kernels**, now ~3 ms together.
+![where the step goes now](figs/glm-step-now.png)
+
+Of a ~21 ms step:
+- **the MoE, ~8 ms, plus most of the 2.4 ms all-reduce**, which is GPUs waiting
+  for the slowest one's MoE: hot-expert imbalance;
+- **dense GEMMs, 5 ms**: `decode_gemm` is near its floor; ~1.8 ms is still on
+  cuBLAS/CUTLASS (small shapes, the indexer's fp8 projections, the shared
+  expert, the drafter);
+- **attention, the indexer and DCP's collectives, 3.7-4 ms**: FlashMLA still
+  splits each layer 16 ways and merges the parts (~0.2 ms exposed); the
+  indexer's work grows with context; the collectives are near transfer cost;
+- **the drafter and sampling, 1.2 ms**, and ~0.5 ms idle.
 
 All of it keeps the math identical: no further quantization, no change to the
 drafter or to which experts run.
@@ -357,4 +452,10 @@ Raw data, scripts and every run are in the worklog:
 - `experiments/2026-09-27-glm53-mtp7-profile`: the greedy-bench A/Bs, GSM8K, and
   the figures (`plot_glm.py`);
 - `experiments/2026-09-29-glm-verify-kernels`: the kernel work in section 7,
-  its traces, tests and A/Bs.
+  its traces, tests and A/Bs;
+- `experiments/2026-10-06-skip-layer-kv-grace`, `2026-10-07-mem-reclaim`,
+  `2026-10-08-moe-cost-table`: section 8;
+- `experiments/2026-10-07-skinny-gemm-v2`, `2026-10-08-dflash2-cudagraph`,
+  `2026-10-08-flashmla-split`: section 9;
+- `experiments/2026-10-08-decode-dive-3`: the step breakdown and these
+  sections' figures (`plot_micro.py`).
