@@ -477,6 +477,46 @@ contexts averaged; 4 tokens verified per request):
   lands on Grace). With 500 replicas it fits and costs 15% against c=8 at
   200K (367 vs 432); with none, 21%.
 
+## 11. MTP3 vs DFlash2 away from code
+
+On agentic coding traffic the two 3-token drafters are level in throughput
+(section 10). Is DFlash2 just fitted to that kind of text? To see how each
+holds up elsewhere: 16 prompts, eight of them code (PyTorch autograd,
+a decode roofline script, a paged KV cache, AVX-512 C++, a CUDA transpose, a
+Rust ring buffer, SQL window functions, React), three maths, three prose, a
+French article and plain-language medical advice. Each ran 3 seeds x 512
+tokens at the served sampling, one request at a time so the server's
+acceptance counters belong to it, in two modes: the answer itself (think
+block closed) and as served (reasoning first).
+
+![drafter acceptance off the coding distribution](figs/glm-drafter-ood.png)
+
+Tokens per step (out of 4), answer mode:
+
+| domain | MTP3 | DFlash2 k=3 | DFlash2 / MTP3 | DFlash2 k=7 (prod) |
+| --- | ---: | ---: | ---: | ---: |
+| code (8) | 2.63 | 2.53 | -4% | 3.15 |
+| maths (3) | 2.90 | 2.74 | -6% | 3.76 |
+| prose (3) | 2.01 | 1.82 | -9% | 1.95 |
+| French, medical (2) | 2.68 | 2.39 | -11% | 2.85 |
+| all 16 | 2.53 | 2.37 | -6% | 2.87 |
+
+- **DFlash2 trails MTP3 at the same draft length on 14 of 16 prompts, and the
+  gap widens away from code** (-4% on code to -11% on French and medical
+  text). With reasoning on, the overall gap is similar (2.42 vs 2.55) and maths
+  flips slightly in DFlash2's favour.
+- **The gap is the first draft token.** DFlash2 accepts it 63% of the time
+  against MTP3's 72%; once a token is accepted, its next ones are as good or
+  better (70% vs 65-68%). MTP predicts the first token conditioned on the one
+  just accepted; DFlash2 drafts the whole block in one parallel pass.
+- **On prose, prod's 7-token DFlash2 gains nothing over 3 tokens** (1.95):
+  drafts die by the third token. On structured maths it gains a lot (5.15 on
+  the ODE).
+
+So DFlash2 is somewhat specialised rather than broken: on coding traffic its
+cheaper drafting makes up for ~4% lower acceptance; on general text MTP3
+should be ahead.
+
 ## What's left
 
 ![where the step goes now](figs/glm-step-now.png)
@@ -522,3 +562,5 @@ Raw data, scripts and every run are in the worklog:
   sections' figures (`plot_micro.py`).
 - `experiments/2026-10-08-m32`: section 10: routing replay, kernel grids,
   the served A/B, the concurrency sweep and its figures (`plot_m32.py`).
+- `experiments/2026-10-09-ood-accept`: section 11: prompts, per-request
+  acceptance and per-position counters, the figure (`plot_ood.py`).
