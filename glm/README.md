@@ -465,7 +465,11 @@ request):
 | c=8, DFlash2 k=3, 1,000 replicas | 3.2M | 3,108 | 134 / 125 | 103 / 189 | 81 / 279 | 55 / 376 |
 | c=8, DFlash2 k=3, 500 replicas | 3.2M | 3,108 | 131 / 123 | 101 / 182 | 78 / 281 | 54 / 367 |
 
-![throughput vs requests in flight](figs/glm-concurrency.png)
+![throughput per GPU vs interactivity](figs/glm-concurrency.png)
+
+Each curve is one server config, its points 1, 2, 4 and 8 requests in flight;
+up and to the right is better. The c=8 server on the 1.6M pool traces the
+frontier: the smaller servers add nothing it cannot do at the same load.
 
 - **The KV pool no longer has to be c x 400K.** The planner used to provision
   max_num_seqs full-length sequences, so c=8 meant a 3.2M-token pool: ~320
@@ -474,11 +478,12 @@ request):
   sized in sequences (`VLLM_TIERED_MOE_KV_POOL_SEQS`, here 4 = 1.6M tokens)
   lets 8 requests of up to 400K each share what 4 would have had; vLLM
   preempts if their combined context outgrows it.
-- **c=4 doubles throughput, c=8 reaches ~440 tok/s** (against ~165 for one
-  user), at ~95 and ~65 tok/s per request. On the 1.6M pool c=8 keeps c=4's
+- **c=4 doubles throughput, c=8 reaches ~440 tok/s** (~110 per GPU, against
+  ~165 for one user), at ~95 and ~65 tok/s per request. On the 1.6M pool c=8 keeps c=4's
   hot set and replicas, so a lone request runs about as fast as under c=4.
-- **MTP3 and DFlash2 k=3 are level** on this text: MTP3 accepts a little more,
-  DFlash2's step is a little shorter (section 11 for other text). MTP3 needs a
+- **MTP3 and DFlash2 k=3 are level** on this text up to 4 in flight: MTP3
+  accepts a little more, DFlash2's step is a little shorter (section 11 for
+  other text). At 8 in flight and 50K context MTP3 pulls ahead, 445 vs 412. MTP3 needs a
   3.6 GB HBM reserve (the planner under-counts its layer) where DFlash2 runs
   at 1.7.
 
