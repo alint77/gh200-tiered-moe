@@ -603,6 +603,30 @@ the real runs.
   on two streams wouldn't help. Offloading starts to pay only once the kernel
   is fast enough to be held back by HBM itself.
 
+### How close to the roofline
+
+A perfect MoE kernel reads hot experts at HBM's full 3.6 TB/s and cold ones
+at C2C's full 0.42 TB/s, both at once, so each layer takes as long as the
+slower of the two. Measured against that, our MoE kernel leaves only **5% of
+the decode step** on the table at 8 and 16 requests, and 9-10% at 1-4.
+
+![decode step vs a roofline MoE kernel](figs/glm-moe-headroom.png)
+
+| requests in flight | 1 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: |
+| MoE per layer, today / roofline (us) | 59 / 37 | 156 / 119 | 246 / 221 | 420 / 378 |
+| decode step saved by a perfect kernel | 1.6 ms (9%) | 2.8 ms (10%) | 1.9 ms (5%) | 3.2 ms (5%) |
+
+From 4 requests on, the Grace link is the slower read, so it sets the
+roofline, and no kernel can beat it. The rest of the step (attention, dense
+GEMMs, the all-reduce, the drafter) now holds as much time as the MoE.
+
+The tensor cores aren't the limit either. At the ~630 TFLOP/s a power-limited
+GH200 sustains, the MoE would only become compute-bound at ~49 tokens per
+expert (~1,600 tokens per step). Decode gives each expert 1.3-2.9 tokens, and
+the tensor cores sit ~20% busy. What's left is instruction issue: unpacking
+int4 keeps the SMs ~57% busy, and that's the 5-10% above.
+
 ## What's left
 
 ![where the step goes now](figs/glm-step-now.png)
