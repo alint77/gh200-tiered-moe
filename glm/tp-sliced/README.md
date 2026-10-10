@@ -88,11 +88,14 @@ scripts) with expert parallelism off and no replicas:
   per GPU depending on the HBM reserve, the same residency as EP's ~3,400-3,700
   whole experts.
 
-| config | drafter | max requests | KV pool | HBM reserve | hot slices / GPU |
-| --- | --- | ---: | ---: | ---: | ---: |
-| prod (Claude Code) | DFlash2 k=7 | 1 | 400K | 1.7 GiB | 14,748 |
-| c=8 | MTP3 | 8 | 1.6M (`VLLM_TIERED_MOE_KV_POOL_SEQS=4`) | 3.6 GiB | 13,614 |
-| c=16 | MTP3 | 16 | 1.6M | 4.0 GiB | 13,528 |
+| config | drafter | max requests | KV pool | HBM reserve | hot slices / GPU (≈ whole experts) | EP, whole experts / GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| prod (Claude Code) | DFlash2 k=7 | 1 | 400K | 1.7 GiB | 14,748 (3,687) | 3,671 |
+| c=8 | MTP3 | 8 | 1.6M (`VLLM_TIERED_MOE_KV_POOL_SEQS=4`) | 3.6 GiB | 13,614 (3,404) | 3,381 |
+| c=16 | MTP3 | 16 | 1.6M | 4.0 GiB | 13,528 (3,382) | - |
+
+Out of 19,200 experts (75 layers x 256), that's 70-77% hot. The MTP3
+configs keep ~300 fewer because they need a bigger HBM reserve.
 
 c=16 also captures CUDA graphs every 4 tokens up to 64. The Claude Code
 launcher is `claude-glm53-sliced-df2-dcp4.sh` in the vLLM tree; the c=16
@@ -171,7 +174,7 @@ the real runs.
 | expert bytes read from Grace | 9% | 11% | 13% | 17% |
 | MoE kernel vs all in HBM, ideal | -9% | -2% | +16% | +42% |
 | MoE kernel vs all in HBM, measured | -1% | +3% | +4% | +23% |
-| extra time per decode step | 0 | 0.4 ms | 0.8 ms | 5.8 ms (10%) |
+| extra time per decode step | 0 | 0.4 ms | 0.8 ms | 5.3 ms (10%) |
 
 - **Up to 8 requests, offloading is nearly free**: at most 0.8 ms of a ~38 ms
   step (2%). At 16 it costs ~10%.
@@ -205,7 +208,7 @@ the real runs.
 
 A perfect MoE kernel reads hot experts at HBM's full 3.6 TB/s and cold ones
 at C2C's full 0.42 TB/s, both at once, so each layer takes as long as the
-slower of the two. Measured against that, our MoE kernel leaves only **5% of
+slower of the two. Measured against that, our MoE kernel leaves only **5-6% of
 the decode step** on the table at 8 and 16 requests, and 9-10% at 1-4.
 
 ![decode step vs a roofline MoE kernel](figs/glm-moe-headroom.png)
@@ -213,7 +216,7 @@ the decode step** on the table at 8 and 16 requests, and 9-10% at 1-4.
 | requests in flight | 1 | 4 | 8 | 16 |
 | --- | ---: | ---: | ---: | ---: |
 | MoE per layer, today / roofline (us) | 59 / 37 | 156 / 119 | 246 / 221 | 420 / 378 |
-| decode step saved by a perfect kernel | 1.6 ms (9%) | 2.8 ms (10%) | 1.9 ms (5%) | 3.2 ms (5%) |
+| decode step saved by a perfect kernel | 1.6 ms (9%) | 2.8 ms (10%) | 1.9 ms (5%) | 3.2 ms (6%) |
 
 From 4 requests on, the Grace link is the slower read, so it sets the
 roofline, and no kernel can beat it. The rest of the step (attention, dense
@@ -230,8 +233,21 @@ int4 keeps the SMs ~57% busy, and that's the 5-10% above.
 - **The MoE kernel** is 5-10% of the step from its roofline (above).
 - **Prefill** is 4-8% slower than EP.
 - **Dense GEMMs** above 32 tokens run on cuBLAS.
-- **Where the extra ~19 ms per step from 8 to 16 requests goes** hasn't been
-  profiled yet.
+- **Going from 8 to 16 requests** (5K context, Nsight Systems; decode steps
+  only, all 16 requests decoding) the step grows from 37.6 to 51.3 ms:
+
+  | ms per step | 8 requests | 16 requests |
+  | --- | ---: | ---: |
+  | MoE kernels | 19.8 | 28.3 |
+  | dense GEMMs | 5.1 | 5.6 |
+  | DCP collectives | 3.0 | 4.8 |
+  | attention | 2.0 | 3.1 |
+  | all-reduce + norm | 2.1 | 2.7 |
+  | outside the verify graph (drafter, sampling) | 2.6 | 3.2 |
+  | everything else, idle | 3.0 | 3.6 |
+
+  Most of the growth (8.5 of 13.7 ms) is the MoE: twice the tokens touch
+  ~40% more experts, and more of them are cold.
 
 ## Where the data is
 
