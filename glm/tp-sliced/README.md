@@ -94,8 +94,12 @@ scripts) with expert parallelism off and no replicas:
 | c=8 | MTP3 | 8 | 1.6M (`VLLM_TIERED_MOE_KV_POOL_SEQS=4`) | 3.6 GiB | 13,614 (3,404) | 3,381 |
 | c=16 | MTP3 | 16 | 1.6M | 4.0 GiB | 13,528 (3,382) | - |
 
-Out of 19,200 experts (75 layers x 256), that's 70-77% hot. The MTP3
-configs keep ~300 fewer because they need a bigger HBM reserve.
+Out of 19,200 experts (75 layers x 256), that's 70-77% hot. The c=8 and
+c=16 configs keep ~290 fewer per GPU (5.7 GiB), mostly for their 4x larger KV
+pool: the skip layers' KV is on Grace, but the other layers' KV and the
+indexer cache stay in HBM and grow from ~1.5 to ~6.2 GiB. The bigger HBM
+reserve costs another 1.9 GiB; MTP3's drafter needs ~0.9 GiB less than
+DFlash2's.
 
 c=16 also captures CUDA graphs every 4 tokens up to 64. The Claude Code
 launcher is `claude-glm53-sliced-df2-dcp4.sh` in the vLLM tree; the c=16
