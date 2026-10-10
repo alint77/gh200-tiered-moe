@@ -26,6 +26,9 @@ for one user; with up to 32 tokens per decode step it serves 4 users at ~330
 tok/s and 8 at ~440, each with 400K of context on a shared KV pool:
 [glm/README.md](glm/README.md) tracks what was different, what it took, and
 where the gap is.
+Splitting every expert four ways across the GPUs instead (TP-sliced) makes
+decode another 11-13% faster and serves 16 users at ~685 tok/s:
+[glm/tp-sliced](glm/tp-sliced/README.md).
 
 ## The hardware
 
