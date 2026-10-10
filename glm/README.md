@@ -467,9 +467,20 @@ request):
 
 ![throughput per GPU vs interactivity](figs/glm-concurrency.png)
 
-Each curve is one server config, its points 1, 2, 4 and 8 requests in flight;
-up and to the right is better. The c=8 server on the 1.6M pool traces the
-frontier: the smaller servers add nothing it cannot do at the same load.
+Each curve is one server config, its points the number of requests in flight;
+up and to the right is better. Among the EP servers, c=8 on the 1.6M pool is
+the best at every load. The green lines are the TP-sliced MoE
+([section 12](#12-every-gpu-gets-a-quarter-of-every-expert-tp-sliced-moe)):
+higher at every load, and the c=16 server keeps going to ~685 tok/s.
+
+TP-sliced, MTP3, same pool (tok/s per request / total, 5K and 50K averaged):
+
+| config | hot / GPU* | 1 | 2 | 4 | 8 | 12 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| c=8 | 3,404 | 183 / 168 | 144 / 253 | 111 / 375 | 77 / 506 | | |
+| **c=16** | 3,382 | 175 / 161 | 147 / 261 | 109 / 373 | 78 / 517 | 61 / 601 | **53 / 685** |
+
+\*In whole experts; TP-sliced stores quarter-expert slices (13,614 and 13,528).
 
 - **The KV pool no longer has to be c x 400K.** The planner used to provision
   max_num_seqs full-length sequences, so c=8 meant a 3.2M-token pool: ~320
@@ -527,6 +538,71 @@ So DFlash2 is somewhat specialised rather than broken: on coding traffic its
 cheaper drafting makes up for ~4% lower acceptance; on general text MTP3
 should be ahead.
 
+## 12. Every GPU gets a quarter of every expert (TP-sliced MoE)
+
+So far each GPU owned whole experts (expert parallel, EP). A step then waits
+for whichever GPU drew the busiest experts, and we kept ~2,000 extra copies of
+popular experts on Grace just to even that out. TP-sliced flips it: every GPU
+holds a quarter of every expert, so all four do the same work every step and
+no copies are needed. One kernel reads the hot quarters from HBM and the cold
+ones straight from Grace over C2C, at the same time.
+
+- **11-13% faster at every load** with 1-8 requests (8 servers per layout,
+  same nodes): the step drops by 2.6 ms with one request and 5 ms with eight.
+  Same math, same acceptance.
+- **16 requests now fit.** The decode paths take 64 tokens a step (16 x 4).
+  At 16 in flight a server gives **~685 tok/s (~170 per GPU), +35% over 8**,
+  and each request still gets 50-54 tok/s. The extra slots cost only 86 hot
+  slices (0.6%), so the server is as fast as the c=8 one at light load.
+- One bug on the way: above 40 tokens the kernel very rarely returned
+  garbage, because a buffer in shared memory could be refilled while some
+  warps were still reading it. One fence instruction fixes it, at no cost.
+
+### What offloading costs
+
+All experts can't fit in HBM (that would take ~95 GB per GPU), so about 30%
+of each layer's experts live on Grace. How much faster would decode be if they
+all fit? We timed the MoE kernel on the same work twice, once as served and
+once with every expert in HBM, and applied the difference to the profiles of
+the real runs.
+
+![offloaded vs all experts in HBM](figs/glm-offload.png)
+
+| requests in flight | 1 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: |
+| expert bytes read from Grace | 9% | 11% | 13% | 17% |
+| MoE kernel vs all in HBM, ideal | -9% | -2% | +16% | +42% |
+| MoE kernel vs all in HBM, measured | -1% | +3% | +4% | +23% |
+| extra time per decode step | 0 | 0.4 ms | 0.8 ms | 5.8 ms (10%) |
+
+- **Up to 8 requests, offloading is nearly free**: at most 0.8 ms of a ~38 ms
+  step (2%). At 16 it costs ~10%.
+- **Why it doesn't win.** Say a layer needs 7 experts and 1 is on Grace. If
+  HBM were the bottleneck, the other 6 would load in 6/7 of the time and
+  the Grace one would load alongside them, so offloading would be ~14% faster.
+  But HBM isn't the bottleneck here; the SMs' math is. Unpacking the int4
+  weights and multiplying keeps each SM busy 80-90% of the time, at about
+  22 GB/s per SM, so all 132 together reach only ~2.9 of HBM's 3.6 TB/s. A
+  byte from Grace needs the same math as a byte from HBM, so the 16 SMs that
+  do the Grace experts are 16 SMs missing from the hot ones, and those get 12%
+  slower. That cancels the 12-13% fewer bytes they read. Kernel traces show
+  this directly, and giving Grace 8, 12, 24 or 32 SMs instead only makes it
+  worse.
+
+  | 8 requests (32 tokens) | time |
+  | --- | ---: |
+  | 108 hot experts, 132 SMs | 207 us |
+  | 125 hot experts, 132 SMs (everything in HBM) | 233 us |
+  | 108 hot on 116 SMs + 17 cold on 16 SMs (as served) | 242 us |
+
+- **At 16 requests**, 17% of the bytes come from Grace, the link runs at 91% of
+  its peak, and Grace sets the pace.
+- **The EP kernels could overlap for free** (section 1) because vLLM's Marlin
+  left room on every SM, and the cold kernel ran in it. Our kernel already
+  fills that room with the math, so going back to two kernels
+  on two streams wouldn't help. Offloading starts to pay only once the kernel
+  is fast enough to be held back by HBM itself.
+
 ## What's left
 
 ![where the step goes now](figs/glm-step-now.png)
@@ -574,3 +650,6 @@ Raw data, scripts and every run are in the worklog:
   the served A/B, the concurrency sweep and its figures (`plot_m32.py`).
 - `experiments/2026-10-09-ood-accept`: section 11: prompts, per-request
   acceptance and per-position counters, the figure (`plot_ood.py`).
+- `experiments/2026-10-09-tp-sliced-experts`: section 12 and the TP-sliced
+  lines in section 10: the kernel, its tests and reviews, the served A/Bs, the
+  c=16 runs, the offload analysis and the figures (`plot_writeup.py`).
