@@ -206,6 +206,28 @@ leaving gaps between kernels that are now gone. (vLLM's all-to-all variant of th
 combine measured within noise; NCCL's symmetric-memory kernels broke CUDA graph
 capture here.)
 
+**At 16 requests the same kernels were slow again.** With MTP3, 16 requests
+put 64 tokens through every layer, and the trace showed 34 µs per query gather
+and 19 µs per combine, ~4.2 ms of a 51 ms step. The gather read its peers in
+order: the whole grid copied one peer's part, then the next one's, so only
+one of the three NVLink links carried data at a time. Interleaving the source ranks
+every 512 bytes, with 8 loads in flight per thread, puts all three links to
+work; the combine now gives each (token, head) pair one warp that loads every
+rank's part before the math. Same blocks, same barriers, bitwise-identical
+output. At 64 tokens the gather drops **34 -> 16.5 µs** (now ~118 GB/s per
+link, of ~150) and the combine **18.5 -> 15.4 µs**; at 8 tokens the gather
+goes 7.8 -> 6.2. Served, paired on the same node (two nodes, opposite order):
+
+| context | 8 requests | 16 requests |
+| --- | ---: | ---: |
+| 5K | -0.77 ms/step | -1.46 ms/step |
+| 50K | -0.55 ms/step | -0.76 ms/step |
+
+About **-2% at 16 requests**. The barrier-free push design from NVIDIA's
+"Every µs Matters" was prototyped too: correct under drifting ranks, but no
+faster, since at this size the barriers are not the cost. The fixed cost left
+is ~5.5 µs per call.
+
 **On the agentic tasks, DCP4 still wins, even against a shorter context.** With
 DCP off at MiMo's 250K context, a step takes 28.8 ms against DCP4's 27.7-28.1
 at 400K (same tasks and point; prefix caching doesn't change decode, as the
@@ -557,7 +579,8 @@ Of a ~21 ms step:
   expert, the drafter);
 - **attention, the indexer and DCP's collectives, 3.7-4 ms**: FlashMLA still
   splits each layer 16 ways and merges the parts (~0.2 ms exposed); the
-  indexer's work grows with context; the collectives are near transfer cost;
+  indexer's work grows with context; the collectives are near transfer cost
+  (at 64 tokens only since the fix in section 4);
 - **the drafter and sampling, 1.2 ms**, and ~0.5 ms idle.
 
 All of it keeps the math identical: no further quantization, no change to the
@@ -594,3 +617,5 @@ Raw data, scripts and every run are in the worklog:
   acceptance and per-position counters, the figure (`plot_ood.py`).
 - `experiments/2026-10-09-tp-sliced-experts`: section 12 and the TP-sliced
   lines in section 10; see [the TP-sliced page](tp-sliced/README.md#where-the-data-is).
+- `experiments/2026-10-11-dcp-oneshot-bw`: the 64-token DCP collectives in
+  section 4: microbenchmarks, the push prototype, the served A/B.

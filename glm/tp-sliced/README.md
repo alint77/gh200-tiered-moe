@@ -253,6 +253,13 @@ int4 keeps the SMs ~57% busy, and that's the 5-10% above.
   Most of the growth (8.5 of 13.7 ms) is the MoE: twice the tokens touch
   ~40% more experts, and more of them are cold.
 
+  The DCP collectives grew more than their bytes: the query gather read one
+  peer at a time. Reading all three at once ([main page, section
+  4](../README.md#4-dcp4-sharding-the-kv-cache-across-the-gpus)) saves ~1.6
+  ms of those 4.8 in the microbenchmark; served, the step drops 1.46 / 0.76 ms
+  at 5K / 50K with 16 requests and 0.55-0.77 ms with 8. The table is from
+  before the fix.
+
 ## Where the data is
 
 Everything is in the worklog's
